@@ -1,197 +1,223 @@
 #!/bin/bash
 
 ################################################################################
-# OpenClaw VPS Automatic Setup Script
-# Автоматическая настройка безопасности VPS для OpenClaw
-# 
+# OpenClaw VPS Automatic Setup Script v4.0
+# Автоматическая настройка безопасности VPS + установка OpenClaw
+#
 # Использование:
-#   curl -fsSL https://your-domain/setup-openclaw.sh | bash
-#   или
 #   bash setup-openclaw.sh
 #
 # Требования:
-#   - Ubuntu 22.04 LTS
+#   - Ubuntu 22.04+ LTS
 #   - Запускать от root
 #   - SSH ключ уже установлен в /root/.ssh/authorized_keys
+#
+# Changelog v4:
+#   - npm вместо pnpm (pnpm не подтягивает зависимости плагинов: grammy и др.)
+#   - Автоматическая установка OpenClaw через npm
+#   - UFW ставится автоматически
+#   - SSH ключ: фикс кодировки (\r, BOM)
+#   - KbdInteractiveAuthentication отключён
+#   - Инструкции с полным Windows-путём к ключу
 ################################################################################
 
-set -e  # Exit on error
+set -euo pipefail
 
-# Цвета для вывода
+# ─── Настройки ────────────────────────────────────────────────────────────────
+OPENCLAW_USER="openclaw"
+OPENCLAW_PORT="${OPENCLAW_PORT:-3000}"
+
+# ─── Цвета ────────────────────────────────────────────────────────────────────
 RED='\033[0;31m'
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
 BLUE='\033[0;34m'
-NC='\033[0m' # No Color
+NC='\033[0m'
 
-# Функции для логирования
-log_info() {
-    echo -e "${BLUE}[INFO]${NC} $1"
-}
+# ─── Логирование ──────────────────────────────────────────────────────────────
+log_info()    { echo -e "${BLUE}[INFO]${NC} $1"; }
+log_success() { echo -e "${GREEN}[✓]${NC} $1"; }
+log_warning() { echo -e "${YELLOW}[WARNING]${NC} $1"; }
+log_error()   { echo -e "${RED}[ERROR]${NC} $1"; }
 
-log_success() {
-    echo -e "${GREEN}[✓]${NC} $1"
+# ─── Trap для ошибок ──────────────────────────────────────────────────────────
+cleanup_on_error() {
+    local exit_code=$?
+    local line_no=$1
+    if [ $exit_code -ne 0 ]; then
+        log_error "Скрипт упал на строке ${line_no} с кодом ${exit_code}"
+        log_error "Проверьте вывод выше для деталей"
+        if [ -n "${SSH_BACKUP:-}" ] && [ -f "$SSH_BACKUP" ]; then
+            log_warning "Восстанавливаю SSH конфиг из бэкапа..."
+            cp "$SSH_BACKUP" /etc/ssh/sshd_config
+            systemctl restart ssh 2>/dev/null || true
+            log_success "SSH конфиг восстановлен"
+        fi
+    fi
 }
-
-log_warning() {
-    echo -e "${YELLOW}[WARNING]${NC} $1"
-}
-
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+trap 'cleanup_on_error ${LINENO}' ERR
 
 ################################################################################
 # ПРОВЕРКИ
 ################################################################################
 
-log_info "Начинаем автоматическую настройку OpenClaw VPS..."
+log_info "Начинаем автоматическую настройку OpenClaw VPS v4..."
 
-# Проверка, что запускаем от root
+# Проверка root
 if [[ $EUID -ne 0 ]]; then
     log_error "Этот скрипт должен быть запущен от root!"
     echo "Используйте: sudo bash setup-openclaw.sh"
     exit 1
 fi
-
 log_success "Скрипт запущен от root"
 
 # Проверка OS
-if ! grep -q "Ubuntu 22.04" /etc/os-release; then
-    log_warning "Обнаружена не Ubuntu 22.04. Скрипт может работать, но не гарантируется."
+if ! grep -q "Ubuntu" /etc/os-release 2>/dev/null; then
+    log_warning "Обнаружена не Ubuntu. Скрипт может работать некорректно."
 fi
 
 # Проверка SSH ключа
-if [ ! -f /root/.ssh/authorized_keys ]; then
-    log_error "SSH ключ не найден в /root/.ssh/authorized_keys"
-    log_info "Сначала добавьте публичный ключ в панели HOSTKEY и переустановите сервер"
+if [ ! -f /root/.ssh/authorized_keys ] || [ ! -s /root/.ssh/authorized_keys ]; then
+    log_error "SSH ключ не найден или пуст в /root/.ssh/authorized_keys"
+    log_info "Сначала добавьте публичный ключ в панели хостинга"
     exit 1
 fi
-
 log_success "SSH ключ найден"
 
 ################################################################################
 # 1. СМЕНА ПАРОЛЯ ROOT
 ################################################################################
 
-log_info "Генерирую новый безопасный пароль для root..."
+log_info "Генерирую новый пароль root..."
 
-# Генерируем случайный пароль (20 символов, буквы+цифры+спец.символы)
-ROOT_PASSWORD=$(openssl rand -base64 20 | tr -d "=+/" | cut -c1-20)
+ROOT_PASSWORD=$(openssl rand -base64 24 | tr -d "=+/" | cut -c1-24)
 
-log_info "Новый пароль root: ${GREEN}${ROOT_PASSWORD}${NC}"
-log_warning "СОХРАНИТЕ ЭТОТ ПАРОЛЬ В БЕЗОПАСНОМ МЕСТЕ!"
-log_info "Вы можете использовать его для аварийного доступа"
-
-# Устанавливаем пароль
-echo "root:${ROOT_PASSWORD}" | chpasswd
+chpasswd <<< "root:${ROOT_PASSWORD}"
 
 log_success "Пароль root изменён"
 
-# Сохраняем пароль в файл для вас (с ограничением доступа)
-echo "OpenClaw VPS Security Setup - $(date)" > /root/SECURITY_CREDENTIALS.txt
-echo "=======================================" >> /root/SECURITY_CREDENTIALS.txt
-echo "Root password: ${ROOT_PASSWORD}" >> /root/SECURITY_CREDENTIALS.txt
-echo "Root SSH: root@$(hostname -I | awk '{print $1}')" >> /root/SECURITY_CREDENTIALS.txt
-echo "Username: openclaw" >> /root/SECURITY_CREDENTIALS.txt
-echo "Saved: $(date)" >> /root/SECURITY_CREDENTIALS.txt
-chmod 600 /root/SECURITY_CREDENTIALS.txt
+SERVER_IP=$(hostname -I | awk '{print $1}')
+CREDENTIALS_FILE="/root/SECURITY_CREDENTIALS.txt"
 
-log_success "Креденшалы сохранены в /root/SECURITY_CREDENTIALS.txt"
+cat > "$CREDENTIALS_FILE" <<EOF
+OpenClaw VPS Security Setup - $(date)
+=======================================
+Root password: ${ROOT_PASSWORD}
+SSH: ssh ${OPENCLAW_USER}@${SERVER_IP}
+User: ${OPENCLAW_USER}
+Saved: $(date)
+EOF
+chmod 600 "$CREDENTIALS_FILE"
+
+log_success "Креденшалы сохранены в ${CREDENTIALS_FILE}"
 
 ################################################################################
-# 2. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ openclaw
+# 2. СОЗДАНИЕ ПОЛЬЗОВАТЕЛЯ
 ################################################################################
 
-log_info "Создаю пользователя 'openclaw'..."
+log_info "Создаю пользователя '${OPENCLAW_USER}'..."
 
-if id "openclaw" &>/dev/null; then
-    log_warning "Пользователь 'openclaw' уже существует, пропускаю создание"
+if id "${OPENCLAW_USER}" &>/dev/null; then
+    log_warning "Пользователь '${OPENCLAW_USER}' уже существует, пропускаю"
 else
-    useradd -m -s /bin/bash openclaw
-    log_success "Пользователь 'openclaw' создан"
+    useradd -m -s /bin/bash "${OPENCLAW_USER}"
+    log_success "Пользователь '${OPENCLAW_USER}' создан"
 fi
 
 ################################################################################
-# 3. КОПИРОВАНИЕ SSH КЛЮЧА
+# 3. КОПИРОВАНИЕ SSH КЛЮЧА (с фиксом кодировки)
 ################################################################################
 
-log_info "Копирую SSH ключ для пользователя 'openclaw'..."
+log_info "Копирую SSH ключ для '${OPENCLAW_USER}'..."
 
-mkdir -p /home/openclaw/.ssh
-cp /root/.ssh/authorized_keys /home/openclaw/.ssh/authorized_keys
-chown -R openclaw:openclaw /home/openclaw/.ssh
-chmod 700 /home/openclaw/.ssh
-chmod 600 /home/openclaw/.ssh/authorized_keys
+mkdir -p /home/${OPENCLAW_USER}/.ssh
 
-log_success "SSH ключ скопирован"
+# Копируем ключ и чистим кодировку (\r, BOM)
+sed 's/\r$//' /root/.ssh/authorized_keys | tr -d '\xEF\xBB\xBF' > /home/${OPENCLAW_USER}/.ssh/authorized_keys
 
-################################################################################
-# 4. ДОБАВЛЕНИЕ В SUDOERS
-################################################################################
+chown -R ${OPENCLAW_USER}:${OPENCLAW_USER} /home/${OPENCLAW_USER}/.ssh
+chmod 700 /home/${OPENCLAW_USER}/.ssh
+chmod 600 /home/${OPENCLAW_USER}/.ssh/authorized_keys
 
-log_info "Добавляю 'openclaw' в sudoers (для sudo без пароля)..."
-
-if grep -q "^openclaw ALL=(ALL) NOPASSWD:ALL" /etc/sudoers; then
-    log_warning "'openclaw' уже в sudoers, пропускаю"
-else
-    echo "openclaw ALL=(ALL) NOPASSWD:ALL" >> /etc/sudoers
-    log_success "'openclaw' добавлен в sudoers"
+if [ ! -s /home/${OPENCLAW_USER}/.ssh/authorized_keys ]; then
+    log_error "authorized_keys для ${OPENCLAW_USER} пуст! Прерываю."
+    exit 1
 fi
+
+log_success "SSH ключ скопирован и очищен от артефактов кодировки"
+
+################################################################################
+# 4. SUDOERS (безопасно через /etc/sudoers.d/)
+################################################################################
+
+log_info "Настраиваю sudoers для '${OPENCLAW_USER}'..."
+
+SUDOERS_FILE="/etc/sudoers.d/${OPENCLAW_USER}"
+
+echo "${OPENCLAW_USER} ALL=(ALL) NOPASSWD:ALL" > "$SUDOERS_FILE"
+chmod 440 "$SUDOERS_FILE"
+
+if ! visudo -c -f "$SUDOERS_FILE" &>/dev/null; then
+    log_error "Ошибка в sudoers файле! Удаляю..."
+    rm -f "$SUDOERS_FILE"
+    exit 1
+fi
+
+log_success "Sudoers настроен (${SUDOERS_FILE})"
 
 ################################################################################
 # 5. КОНФИГУРАЦИЯ SSH
 ################################################################################
 
-log_info "Конфигурирую SSH (отключаю пароли, включаю только ключи)..."
+log_info "Конфигурирую SSH..."
 
-# Backup исходного конфига
-cp /etc/ssh/sshd_config /etc/ssh/sshd_config.backup.$(date +%s)
-log_success "Бэкап конфига сохранён"
+SSH_BACKUP="/etc/ssh/sshd_config.backup.$(date +%s)"
+cp /etc/ssh/sshd_config "$SSH_BACKUP"
+log_success "Бэкап SSH конфига: ${SSH_BACKUP}"
 
-# Изменяем параметры (используем sed для замены)
-sed -i 's/^#PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
-sed -i 's/^PermitRootLogin yes/PermitRootLogin no/' /etc/ssh/sshd_config
+set_sshd_param() {
+    local param="$1"
+    local value="$2"
+    local config="/etc/ssh/sshd_config"
+    sed -i "/^#\?${param}\s/d" "$config"
+    echo "${param} ${value}" >> "$config"
+}
 
-sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
-sed -i 's/^PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config
+set_sshd_param "PermitRootLogin" "no"
+set_sshd_param "PasswordAuthentication" "no"
+set_sshd_param "PubkeyAuthentication" "yes"
+set_sshd_param "ChallengeResponseAuthentication" "no"
+set_sshd_param "KbdInteractiveAuthentication" "no"
 
-sed -i 's/^#PubkeyAuthentication yes/PubkeyAuthentication yes/' /etc/ssh/sshd_config
-
-# Убедимся, что параметры установлены (если их еще не было)
-if ! grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
-    echo "PermitRootLogin no" >> /etc/ssh/sshd_config
+if ! sshd -t 2>/dev/null; then
+    log_error "SSH конфиг имеет ошибки! Восстанавливаю..."
+    cp "$SSH_BACKUP" /etc/ssh/sshd_config
+    exit 1
 fi
+log_success "SSH конфиг валиден"
 
-if ! grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
-    echo "PasswordAuthentication no" >> /etc/ssh/sshd_config
-fi
+systemctl restart ssh
 
-if ! grep -q "^PubkeyAuthentication yes" /etc/ssh/sshd_config; then
-    echo "PubkeyAuthentication yes" >> /etc/ssh/sshd_config
-fi
-
-# Проверяем синтаксис конфига
-if ! sshd -t; then
-    log_error "SSH конфиг имеет ошибки! Восстанавливаю из бэкапа..."
-    cp /etc/ssh/sshd_config.backup.* /etc/ssh/sshd_config
+sleep 1
+if ! systemctl is-active --quiet ssh; then
+    log_error "SSH не запустился после рестарта! Восстанавливаю..."
+    cp "$SSH_BACKUP" /etc/ssh/sshd_config
+    systemctl restart ssh
     exit 1
 fi
 
-log_success "SSH конфиг обновлён"
-
-# Перезагружаем SSH daemon
-systemctl restart ssh
-log_success "SSH daemon перезагружен"
+log_success "SSH daemon перезагружен и работает"
 
 ################################################################################
 # 6. ОБНОВЛЕНИЕ СИСТЕМЫ
 ################################################################################
 
-log_info "Обновляю систему и устанавливаю необходимые пакеты..."
+log_info "Обновляю систему..."
+
+export DEBIAN_FRONTEND=noninteractive
 
 apt-get update -qq
-apt-get upgrade -y -qq
+apt-get upgrade -y -qq -o Dpkg::Options::="--force-confdef" -o Dpkg::Options::="--force-confold"
 apt-get install -y -qq \
     curl \
     git \
@@ -206,109 +232,134 @@ apt-get install -y -qq \
 log_success "Система обновлена"
 
 ################################################################################
-# 7. ПРОВЕРКА Node.js
+# 7. NODE.JS
 ################################################################################
 
-log_info "Проверяю Node.js версию..."
+log_info "Проверяю Node.js..."
 
-if ! command -v node &> /dev/null; then
-    log_warning "Node.js не найден, устанавливаю..."
-    curl -fsSL https://deb.nodesource.com/setup_24.x | sudo -E bash -
-    apt-get install -y nodejs
+if ! command -v node &>/dev/null; then
+    log_info "Node.js не найден, устанавливаю v24..."
+    curl -fsSL https://deb.nodesource.com/setup_24.x -o /tmp/nodesource_setup.sh
+    if [ ! -s /tmp/nodesource_setup.sh ]; then
+        log_error "Не удалось скачать установщик Node.js"
+        exit 1
+    fi
+    bash /tmp/nodesource_setup.sh
+    apt-get install -y -qq nodejs
+    rm -f /tmp/nodesource_setup.sh
+    log_success "Node.js $(node --version) установлен"
 else
-    NODE_VERSION=$(node --version)
-    log_success "Node.js ${NODE_VERSION} уже установлен"
+    log_success "Node.js $(node --version) уже установлен"
 fi
 
 ################################################################################
-# 8. FIREWALL (если нужен)
+# 8. OPENCLAW (через npm — pnpm не подтягивает зависимости плагинов)
 ################################################################################
 
-log_info "Включаю базовый firewall..."
+log_info "Устанавливаю OpenClaw через npm для '${OPENCLAW_USER}'..."
 
-# Обычно на VPS уже есть firewall, но проверим
-if ! command -v ufw &> /dev/null; then
-    log_info "UFW не установлен, пропускаю"
-else
-    # Разрешаем SSH, HTTP, HTTPS
+# npm global в homedir пользователя (без sudo, без конфликтов)
+su - "${OPENCLAW_USER}" -c '
+    # Создаём директорию для глобальных npm-пакетов
+    mkdir -p ~/.npm-global
+
+    # Настраиваем npm prefix
+    npm config set prefix "~/.npm-global"
+
+    # Добавляем в PATH если ещё не добавлено
+    if ! grep -q "npm-global/bin" ~/.bashrc 2>/dev/null; then
+        echo "" >> ~/.bashrc
+        echo "# npm global packages" >> ~/.bashrc
+        echo "export PATH=\$HOME/.npm-global/bin:\$PATH" >> ~/.bashrc
+    fi
+
+    # Устанавливаем OpenClaw
+    export PATH=$HOME/.npm-global/bin:$PATH
+    npm install -g openclaw@latest
+'
+
+# Проверяем установку
+OPENCLAW_VERSION=$(su - "${OPENCLAW_USER}" -c 'source ~/.bashrc 2>/dev/null; openclaw --version 2>/dev/null' || echo "не определена")
+log_success "OpenClaw ${OPENCLAW_VERSION} установлен для ${OPENCLAW_USER}"
+
+################################################################################
+# 9. FIREWALL
+################################################################################
+
+log_info "Настраиваю firewall..."
+
+if ! command -v ufw &>/dev/null; then
+    log_info "UFW не найден, устанавливаю..."
+    apt-get install -y -qq ufw
+fi
+
+if command -v ufw &>/dev/null; then
     ufw default deny incoming 2>/dev/null || true
     ufw default allow outgoing 2>/dev/null || true
-    ufw allow 22/tcp 2>/dev/null || true
-    ufw allow 80/tcp 2>/dev/null || true
-    ufw allow 443/tcp 2>/dev/null || true
+    ufw allow 22/tcp comment 'SSH' 2>/dev/null || true
+    ufw allow 80/tcp comment 'HTTP' 2>/dev/null || true
+    ufw allow 443/tcp comment 'HTTPS' 2>/dev/null || true
+    ufw allow "${OPENCLAW_PORT}/tcp" comment 'OpenClaw' 2>/dev/null || true
     ufw --force enable 2>/dev/null || true
-    log_success "Firewall настроен"
+    log_success "Firewall настроен (SSH, HTTP, HTTPS, OpenClaw:${OPENCLAW_PORT})"
+else
+    log_warning "Не удалось установить UFW"
 fi
 
 ################################################################################
-# 9. ИТОГОВЫЙ ОТЧЕТ
+# 10. ИТОГОВЫЙ ОТЧЁТ
 ################################################################################
 
-log_info "======================================="
-log_success "Автоматическая настройка завершена!"
-log_info "======================================="
-
 echo ""
-echo -e "${BLUE}ДОСТУП К СЕРВЕРУ:${NC}"
-echo -e "${GREEN}SSH как openclaw:${NC}"
-echo "  ssh -i ~/.ssh/id_openclaw openclaw@$(hostname -I | awk '{print $1}')"
+log_success "=========================================="
+log_success "  Автоматическая настройка завершена!"
+log_success "=========================================="
 echo ""
-echo -e "${GREEN}Root пароль:${NC} ${ROOT_PASSWORD}"
-echo "  Сохранён в: /root/SECURITY_CREDENTIALS.txt"
+echo -e "${BLUE}ДОСТУП К СЕРВЕРУ (PowerShell на ПК):${NC}"
+echo -e "  ssh -i C:\\Users\\<USERNAME>\\.ssh\\id_openclaw ${OPENCLAW_USER}@${SERVER_IP}"
 echo ""
-echo -e "${BLUE}СЛЕДУЮЩИЕ ШАГИ:${NC}"
-echo "1. Проверьте подключение:"
-echo "   ssh -i ~/.ssh/id_openclaw openclaw@$(hostname -I | awk '{print $1}')"
+echo -e "${BLUE}Root пароль:${NC} ${ROOT_PASSWORD}"
+echo -e "  Сохранён в: ${CREDENTIALS_FILE}"
 echo ""
-echo "2. Установите OpenClaw:"
-echo "   sudo pnpm add -g openclaw@latest"
+echo -e "${RED}⚠ СОХРАНИТЕ ПАРОЛЬ В PASSWORD MANAGER И ЗАКРОЙТЕ ТЕРМИНАЛ${NC}"
 echo ""
-echo "3. Запустите onboarding:"
-echo "   openclaw onboard --install-daemon"
+echo -e "${BLUE}СЛЕДУЮЩИЕ ШАГИ (от пользователя ${OPENCLAW_USER}):${NC}"
+echo "  1. В НОВОМ терминале проверьте подключение:"
+echo "     ssh -i C:\\Users\\<USERNAME>\\.ssh\\id_openclaw ${OPENCLAW_USER}@${SERVER_IP}"
 echo ""
-echo -e "${RED}ВАЖНО:${NC}"
-echo "- Сохраните пароль root в Password Manager"
-echo "- НЕ используйте root для обычной работы"
-echo "- Все команды OpenClaw запускайте от 'openclaw'"
+echo "  2. Запустите onboarding:"
+echo "     openclaw onboard --install-daemon"
+echo ""
+echo "  3. SSH туннель для веб-интерфейса (с ПК):"
+echo "     ssh -i C:\\Users\\<USERNAME>\\.ssh\\id_openclaw -N -L 18789:127.0.0.1:18789 ${OPENCLAW_USER}@${SERVER_IP}"
+echo "     Затем откройте: http://localhost:18789"
 echo ""
 
 ################################################################################
-# 10. ПРОВЕРКИ
+# 11. ФИНАЛЬНЫЕ ПРОВЕРКИ
 ################################################################################
 
-log_info "Выполняю финальные проверки..."
+log_info "Финальные проверки..."
 
-# Проверка SSH конфига
-if grep -q "^PermitRootLogin no" /etc/ssh/sshd_config; then
-    log_success "Root SSH login отключен"
-fi
+CHECKS_PASSED=0
+CHECKS_TOTAL=6
 
-if grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config; then
-    log_success "Password authentication отключена"
-fi
+grep -q "^PermitRootLogin no" /etc/ssh/sshd_config && { log_success "Root SSH login отключён"; ((CHECKS_PASSED++)); } || log_error "Root SSH login НЕ отключён"
+grep -q "^PasswordAuthentication no" /etc/ssh/sshd_config && { log_success "Password auth отключена"; ((CHECKS_PASSED++)); } || log_error "Password auth НЕ отключена"
+id "${OPENCLAW_USER}" &>/dev/null && { log_success "Пользователь '${OPENCLAW_USER}' существует"; ((CHECKS_PASSED++)); } || log_error "Пользователь НЕ создан"
+[ -f "$SUDOERS_FILE" ] && { log_success "Sudoers настроен"; ((CHECKS_PASSED++)); } || log_error "Sudoers НЕ настроен"
+command -v node &>/dev/null && { log_success "Node.js $(node --version)"; ((CHECKS_PASSED++)); } || log_error "Node.js НЕ установлен"
+su - "${OPENCLAW_USER}" -c 'source ~/.bashrc 2>/dev/null; command -v openclaw' &>/dev/null && { log_success "OpenClaw установлен для ${OPENCLAW_USER}"; ((CHECKS_PASSED++)); } || log_error "OpenClaw НЕ установлен"
 
-if id "openclaw" &>/dev/null; then
-    log_success "Пользователь 'openclaw' создан"
-fi
-
-if grep -q "^openclaw ALL=(ALL) NOPASSWD:ALL" /etc/sudoers; then
-    log_success "Sudoers настроен"
+echo ""
+if [ "$CHECKS_PASSED" -eq "$CHECKS_TOTAL" ]; then
+    log_success "Все проверки пройдены (${CHECKS_PASSED}/${CHECKS_TOTAL})"
+else
+    log_warning "Проверки: ${CHECKS_PASSED}/${CHECKS_TOTAL}"
 fi
 
 echo ""
-log_success "Все проверки пройдены!"
-echo ""
-
-################################################################################
-# ВЫВОД ИНФОРМАЦИИ
-################################################################################
-
-log_info "Информация о сервере:"
-echo "  Hostname: $(hostname)"
-echo "  IP: $(hostname -I | awk '{print $1}')"
-echo "  OS: $(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2)"
-echo "  Kernel: $(uname -r)"
-echo "  Node.js: $(node --version)"
+log_info "Сервер: $(hostname) | IP: ${SERVER_IP} | OS: $(grep PRETTY_NAME /etc/os-release | cut -d'"' -f2) | Node: $(node --version 2>/dev/null || echo 'N/A')"
 echo ""
 
 exit 0
